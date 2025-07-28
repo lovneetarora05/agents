@@ -8,8 +8,12 @@ An AI agent that:
 3. Filters out spam, junk, and marketing emails
 4. Creates draft responses for important emails
 5. Handles meeting requests with calendar availability
+6. Includes built-in evaluation capabilities for quality assurance
 
-Usage: python smart_email_responder.py
+Usage: 
+    python smart_email_responder.py                    # Run the agent
+    python smart_email_responder.py --evaluate all     # Run full evaluation
+    python smart_email_responder.py --evaluate accuracy,bias_detection  # Run specific evaluators
 """
 
 import os
@@ -181,6 +185,14 @@ class SmartEmailResponder:
         - Meeting invitations = RESPONSE needed
         - Personal messages from real people = RESPONSE needed
 
+        For emails that need responses, write a professional response body (without greeting/closing - those will be added automatically).
+
+        IMPORTANT: For meeting requests, extract dates and times exactly as mentioned:
+        - If email says "tomorrow", use "tomorrow" as preferred_date
+        - If email says "next Tuesday", use "next Tuesday" as preferred_date  
+        - If email says "7pm" or "19:00", use that exact format as preferred_time
+        - Extract attendee email addresses from the email content
+
         Return this exact JSON structure:
         {{
             "needs_response": false,
@@ -198,8 +210,8 @@ class SmartEmailResponder:
             }}
         }}
 
-        For most promotional emails, use the above template with needs_response: false.
-        Only set needs_response: true for genuine personal/business communications.
+        If needs_response is true, provide a professional response in suggested_response field.
+        For meeting requests, extract meeting details and set has_meeting_request to true.
         """
         
         try:
@@ -253,22 +265,9 @@ class SmartEmailResponder:
                 meeting_request=None
             )
     
-    def check_calendar_availability(self, date_str, time_str, duration_minutes):
-        """Check if requested time slot is available"""
+    def check_calendar_availability_dt(self, requested_dt, duration_minutes):
+        """Check if requested datetime slot is available"""
         try:
-            # Parse the requested datetime
-            if date_str and time_str:
-                datetime_str = f"{date_str} {time_str}"
-                requested_dt = date_parser.parse(datetime_str)
-            else:
-                # Default to next business day at 2 PM if no specific time
-                requested_dt = self._get_next_business_day()
-                requested_dt = requested_dt.replace(hour=14, minute=0, second=0, microsecond=0)
-            
-            # Check if it's within working hours
-            if not self._is_within_working_hours(requested_dt):
-                return False, []
-            
             # Check calendar for conflicts
             end_dt = requested_dt + timedelta(minutes=duration_minutes)
             
@@ -289,6 +288,24 @@ class SmartEmailResponder:
             # If conflicts, suggest alternative times
             alternatives = self._suggest_alternative_times(requested_dt, duration_minutes)
             return False, alternatives
+            
+        except Exception as e:
+            print(f"Error checking availability: {e}")
+            return False, []
+
+    def check_calendar_availability(self, date_str, time_str, duration_minutes):
+        """Check if requested time slot is available (legacy method)"""
+        try:
+            # Parse the requested datetime
+            if date_str and time_str:
+                datetime_str = f"{date_str} {time_str}"
+                requested_dt = date_parser.parse(datetime_str)
+            else:
+                # Default to next business day at 2 PM if no specific time
+                requested_dt = self._get_next_business_day()
+                requested_dt = requested_dt.replace(hour=14, minute=0, second=0, microsecond=0)
+            
+            return self.check_calendar_availability_dt(requested_dt, duration_minutes)
             
         except Exception as e:
             print(f"Error checking availability: {e}")
@@ -352,27 +369,98 @@ class SmartEmailResponder:
         except:
             return False
     
-    def create_meeting_if_available(self, meeting_request, sender_email):
+    def create_meeting_if_available(self, meeting_request, sender_email, email_subject=None, email_body=None):
         """Create meeting if time is available, otherwise suggest alternatives"""
-        available, alternatives = self.check_calendar_availability(
-            meeting_request.preferred_date,
-            meeting_request.preferred_time,
-            meeting_request.duration_minutes
-        )
-        
-        if available:
-            # Create the meeting
-            try:
-                if meeting_request.preferred_date and meeting_request.preferred_time:
-                    datetime_str = f"{meeting_request.preferred_date} {meeting_request.preferred_time}"
-                    start_dt = date_parser.parse(datetime_str)
+        try:
+            # Determine meeting time with proper date parsing
+            if meeting_request.preferred_date and meeting_request.preferred_time:
+                # Handle "tomorrow" specifically - always use actual tomorrow
+                if "tomorrow" in meeting_request.preferred_date.lower():
+                    # Get tomorrow's date
+                    tomorrow = datetime.now() + timedelta(days=1)
+                    try:
+                        # Parse time (handle formats like "19:00", "7pm", "7:00 PM")
+                        time_str = meeting_request.preferred_time.lower().replace(" ", "")
+                        if "pm" in time_str:
+                            time_str = time_str.replace("pm", "")
+                            hour = int(time_str.split(":")[0])
+                            if hour != 12:
+                                hour += 12
+                            minute = int(time_str.split(":")[1]) if ":" in time_str else 0
+                        elif "am" in time_str:
+                            time_str = time_str.replace("am", "")
+                            hour = int(time_str.split(":")[0])
+                            minute = int(time_str.split(":")[1]) if ":" in time_str else 0
+                        else:
+                            # 24-hour format like "19:00"
+                            if ":" in meeting_request.preferred_time:
+                                hour = int(meeting_request.preferred_time.split(":")[0])
+                                minute = int(meeting_request.preferred_time.split(":")[1])
+                            else:
+                                hour = int(meeting_request.preferred_time)
+                                minute = 0
+                        
+                        start_dt = tomorrow.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                        print(f"🗓️ Parsed 'tomorrow {meeting_request.preferred_time}' as: {start_dt}")
+                        
+                    except Exception as e:
+                        print(f"⚠️ Error parsing time '{meeting_request.preferred_time}': {e}")
+                        # Default to tomorrow 7 PM if parsing fails
+                        start_dt = tomorrow.replace(hour=19, minute=0, second=0, microsecond=0)
                 else:
-                    start_dt = self._get_next_business_day().replace(hour=14, minute=0)
-                
+                    # Try parsing other date formats
+                    try:
+                        datetime_str = f"{meeting_request.preferred_date} {meeting_request.preferred_time}"
+                        start_dt = date_parser.parse(datetime_str)
+                        # Ensure it's not in the past
+                        if start_dt < datetime.now():
+                            start_dt = start_dt.replace(year=datetime.now().year + 1)
+                    except:
+                        # Default to next business day at 2 PM if parsing fails
+                        start_dt = self._get_next_business_day().replace(hour=14, minute=0, second=0, microsecond=0)
+            else:
+                # Default to next business day at 2 PM if no specific time
+                start_dt = self._get_next_business_day().replace(hour=14, minute=0, second=0, microsecond=0)
+            
+            # Check availability using the parsed datetime
+            available, alternatives = self.check_calendar_availability_dt(
+                start_dt,
+                meeting_request.duration_minutes
+            )
+            
+            print(f"🕐 Meeting time: {start_dt}")
+            print(f"📅 Available: {available}")
+            print(f"🔄 Alternatives: {len(alternatives) if alternatives else 0}")
+            
+            if available:
+                # Create the actual calendar event
                 end_dt = start_dt + timedelta(minutes=meeting_request.duration_minutes)
                 
+                # Clean up attendee emails
+                attendee_emails = []
+                if sender_email:
+                    # Extract email from "Name <email>" format
+                    clean_sender = sender_email.split('<')[-1].replace('>', '').strip()
+                    attendee_emails.append({'email': clean_sender})
+                
+                # Add other attendees if any
+                for email in meeting_request.attendees:
+                    if email and '@' in email:
+                        attendee_emails.append({'email': email.strip()})
+                
+                print(f"📧 Creating event for attendees: {[att['email'] for att in attendee_emails]}")
+                
+                # Generate meaningful meeting subject
+                meeting_subject = self._generate_meeting_subject(
+                    meeting_request, 
+                    sender_email, 
+                    email_subject,
+                    email_body
+                )
+                
                 event = {
-                    'summary': meeting_request.purpose,
+                    'summary': meeting_subject,
+                    'description': f'Meeting requested via email.\n\nOriginal request: {meeting_request.purpose}\nEmail subject: {email_subject}',
                     'start': {
                         'dateTime': start_dt.isoformat(),
                         'timeZone': 'UTC',
@@ -381,46 +469,71 @@ class SmartEmailResponder:
                         'dateTime': end_dt.isoformat(),
                         'timeZone': 'UTC',
                     },
-                    'attendees': [{'email': sender_email}] + [{'email': email} for email in meeting_request.attendees],
+                    'attendees': attendee_emails,
+                    'reminders': {
+                        'useDefault': True
+                    },
+                    'visibility': 'default',
+                    'status': 'confirmed'
                 }
                 
                 created_event = self.calendar_service.events().insert(
-                    calendarId='primary', body=event
+                    calendarId='primary', 
+                    body=event,
+                    sendNotifications=True  # This ensures calendar invites are sent!
                 ).execute()
                 
+                event_id = created_event.get('id')
+                print(f"✅ Calendar event created: {event_id}")
+                print(f"📧 Calendar invites sent to: {[att['email'] for att in attendee_emails]}")
                 return True, f"Meeting scheduled for {start_dt.strftime('%B %d, %Y at %I:%M %p')}"
                 
-            except Exception as e:
-                print(f"Error creating meeting: {e}")
-                return False, "Error creating meeting"
-        
-        else:
-            # Suggest alternatives
-            if alternatives:
-                alt_text = "\\n".join([
-                    f"• {alt.strftime('%B %d, %Y at %I:%M %p')}" 
-                    for alt in alternatives
-                ])
-                return False, f"The requested time is not available. Here are some alternatives:\\n{alt_text}"
             else:
-                return False, "No suitable alternative times found this week."
+                # Suggest alternatives
+                if alternatives:
+                    alt_text = "\n".join([
+                        f"• {alt.strftime('%B %d, %Y at %I:%M %p')}" 
+                        for alt in alternatives
+                    ])
+                    return False, f"The requested time is not available. Here are some alternatives:\n{alt_text}"
+                else:
+                    return False, "No suitable alternative times found this week."
+                    
+        except Exception as e:
+            print(f"Error in meeting creation: {e}")
+            # Still try to suggest a time even if calendar creation fails
+            next_day = self._get_next_business_day().replace(hour=14, minute=0)
+            return False, f"I'd be happy to meet. How about {next_day.strftime('%B %d, %Y at %I:%M %p')}?"
     
     def create_draft_response(self, email, analysis):
         """Create a draft response in Gmail"""
         try:
-            response_body = analysis.suggested_response
+            # Extract sender name from email address
+            sender_name = self._extract_sender_name(email['sender'])
             
-            # Handle meeting requests
+            # Start with a proper greeting
+            response_body = f"Hi {sender_name},\n\n"
+            
+            # Add the main response content
+            if analysis.suggested_response:
+                response_body += analysis.suggested_response + "\n\n"
+            
+            # Handle meeting requests - ACTUALLY CREATE CALENDAR EVENTS
             if analysis.meeting_request:
                 meeting_created, meeting_info = self.create_meeting_if_available(
                     analysis.meeting_request, 
-                    email['sender']
+                    email['sender'],
+                    email['subject'],  # Pass email subject for better meeting titles
+                    email['body']      # Pass email body for context extraction
                 )
                 
                 if meeting_created:
-                    response_body += f"\\n\\n{meeting_info}. Calendar invite sent!"
+                    response_body += f"{meeting_info}. I've sent you a calendar invite.\n\n"
                 else:
-                    response_body += f"\\n\\n{meeting_info}"
+                    response_body += f"{meeting_info}\n\n"
+            
+            # Add professional closing
+            response_body += "Best regards,\n[Your Name]"
             
             # Create draft message
             message = {
@@ -443,6 +556,130 @@ class SmartEmailResponder:
         except Exception as e:
             print(f"Error creating draft: {e}")
             return None
+    
+    def _extract_sender_name(self, sender_email):
+        """Extract a friendly name from sender email"""
+        # Handle formats like "John Doe <john@example.com>" or just "john@example.com"
+        if '<' in sender_email:
+            name_part = sender_email.split('<')[0].strip()
+            if name_part:
+                return name_part
+        
+        # If no name, use the part before @ in email
+        email_part = sender_email.split('<')[-1].replace('>', '').strip()
+        username = email_part.split('@')[0]
+        
+        # Capitalize and make it friendly
+        return username.replace('.', ' ').replace('_', ' ').title()
+    
+    def _generate_meeting_subject(self, meeting_request, sender_email, email_subject=None, email_body=None):
+        """Generate a meaningful meeting subject using email subject first, then derive from context"""
+        
+        # Step 1: Try to use email subject line if it's meaningful
+        if email_subject and len(email_subject.strip()) > 5:
+            subject = email_subject.strip()
+            
+            # Remove "Re: " prefix if present
+            if subject.lower().startswith('re:'):
+                subject = subject[3:].strip()
+            
+            # Check if subject is vague/generic
+            vague_subjects = [
+                'meeting', 'send meeting invite', 'calendar invite', 'schedule meeting',
+                'let\'s meet', 'meeting request', 'invitation', 'catch up', 'chat',
+                'quick call', 'sync', 'touch base', 'follow up', 'let\'s schedule',
+                'schedule a call', 'call', 'discussion', 'talk', 'connect'
+            ]
+            
+            is_vague = any(vague.lower() in subject.lower() for vague in vague_subjects)
+            
+            # If subject is not vague, use it directly
+            if not is_vague:
+                return subject
+        
+        # Step 2: If subject is vague, derive context from email content
+        if meeting_request.purpose and len(meeting_request.purpose.strip()) > 10:
+            purpose = meeting_request.purpose.strip()
+            
+            # Use AI to create a concise meeting title from the purpose
+            try:
+                context_prompt = f"""
+                Create a concise, professional meeting subject line (max 60 characters) from this meeting request:
+                
+                "{purpose}"
+                
+                Rules:
+                - Make it specific and actionable
+                - Don't start with "Meeting:" or "Meeting about"
+                - Focus on the main topic/goal
+                - Use title case
+                - Examples: "Q4 Budget Review", "Product Launch Strategy", "Team Performance Discussion"
+                
+                Return only the subject line, nothing else.
+                """
+                
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are an expert at creating concise, professional meeting titles."},
+                        {"role": "user", "content": context_prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=50
+                )
+                
+                ai_subject = response.choices[0].message.content.strip().strip('"')
+                if ai_subject and len(ai_subject) > 5:
+                    return ai_subject
+                    
+            except Exception as e:
+                print(f"Error generating AI subject: {e}")
+                # Fallback to cleaned purpose
+                if purpose.lower().startswith('meeting'):
+                    return purpose
+                else:
+                    return f"Meeting: {purpose}"
+        
+        # Step 3: Try to extract context from email body if available
+        if email_body and len(email_body.strip()) > 20:
+            try:
+                body_context_prompt = f"""
+                Extract the main topic/purpose for a meeting from this email content and create a concise meeting subject (max 60 characters):
+                
+                Email: "{email_body[:500]}"
+                
+                Rules:
+                - Focus on the business purpose/topic
+                - Make it specific and professional
+                - Don't start with "Meeting:" 
+                - Use title case
+                - Examples: "Project Status Review", "Contract Discussion", "Team Sync"
+                
+                Return only the subject line, nothing else.
+                """
+                
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are an expert at extracting meeting topics from email content."},
+                        {"role": "user", "content": body_context_prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=50
+                )
+                
+                body_subject = response.choices[0].message.content.strip().strip('"')
+                if body_subject and len(body_subject) > 5:
+                    return body_subject
+                    
+            except Exception as e:
+                print(f"Error extracting context from body: {e}")
+        
+        # Step 4: Fallback to sender-based format
+        sender_name = self._extract_sender_name(sender_email)
+        sender_first_name = sender_name.split()[0] if sender_name else "Guest"
+        
+        return f"Meeting with {sender_first_name}"
     
     def _create_message_raw(self, to, subject, body):
         """Create raw email message"""
@@ -501,6 +738,33 @@ class SmartEmailResponder:
 
 def main():
     """Run the smart email responder"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Smart Email Responder with built-in evaluation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python smart_email_responder.py                           # Run the agent normally
+  python smart_email_responder.py --evaluate all            # Run full evaluation
+  python smart_email_responder.py --evaluate accuracy       # Run specific evaluator
+  python smart_email_responder.py --evaluate all --output report.json  # Save evaluation report
+        """
+    )
+    
+    parser.add_argument(
+        '--evaluate',
+        help='Run evaluation with specified evaluators (comma-separated) or "all"'
+    )
+    
+    parser.add_argument(
+        '--output',
+        help='Output file for evaluation report (JSON format)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Check environment
     if not os.getenv('OPENAI_API_KEY'):
         print("Error: Please set OPENAI_API_KEY in your .env file")
         return
@@ -509,6 +773,43 @@ def main():
         print("Error: Please add credentials.json file")
         return
     
+    # Run evaluation if requested
+    if args.evaluate:
+        print("🔍 Running Smart Email Responder Evaluation")
+        print("=" * 50)
+        
+        try:
+            # Import evaluation module
+            from evaluation_framework.agent_integration import SmartEmailResponderEvaluator
+            
+            # Parse evaluators
+            if args.evaluate.lower() == 'all':
+                evaluators = None
+            else:
+                evaluators = [e.strip() for e in args.evaluate.split(',')]
+            
+            # Run evaluation
+            evaluator = SmartEmailResponderEvaluator()
+            report = evaluator.evaluate(evaluators=evaluators, output_file=args.output)
+            
+            # Print summary
+            summary = report["evaluation_summary"]
+            print(f"\n📊 EVALUATION COMPLETE")
+            print(f"Overall Score: {summary['average_overall_score']:.1%}")
+            print(f"Pass Rate: {summary['pass_rate']:.1%}")
+            print(f"Tests Passed: {summary['passed_tests']}/{summary['total_test_cases']}")
+            
+            if args.output:
+                print(f"📄 Detailed report saved to: {args.output}")
+            
+        except ImportError:
+            print("❌ Evaluation framework not available. Please ensure evaluation_framework is installed.")
+        except Exception as e:
+            print(f"❌ Evaluation failed: {str(e)}")
+        
+        return
+    
+    # Run agent normally
     responder = SmartEmailResponder()
     responder.run()
 
